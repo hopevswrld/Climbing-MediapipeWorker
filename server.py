@@ -1,7 +1,8 @@
 """
-MediaPipe Pose Analysis Worker for Railway
+MediaPipe Pose Analysis Worker
 
-Background worker with a minimal HTTP health check to satisfy Railway.
+PURE BACKGROUND WORKER - NO HTTP, NO PORTS, NO SERVERS
+Just an infinite loop that polls the database and processes videos.
 """
 
 import os
@@ -9,8 +10,6 @@ import math
 import tempfile
 import time
 import traceback
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 import cv2
@@ -25,7 +24,6 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-PORT = int(os.environ.get("PORT", 8080))
 
 TARGET_FPS = 10
 KEYFRAME_ANGLE_DELTA = 20
@@ -49,31 +47,6 @@ LANDMARK_NAMES = [
     "left_ankle", "right_ankle", "left_heel", "right_heel",
     "left_foot_index", "right_foot_index"
 ]
-
-
-# =============================================================================
-# MINIMAL HEALTH CHECK SERVER
-# =============================================================================
-
-class HealthHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler that responds to health checks."""
-    
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
-    
-    def log_message(self, format, *args):
-        # Suppress default logging
-        pass
-
-
-def start_health_server():
-    """Start a minimal HTTP server for Railway health checks."""
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"[Health] Server listening on port {PORT}", flush=True)
-    server.serve_forever()
 
 
 # =============================================================================
@@ -334,7 +307,13 @@ def fetch_pending_job() -> Optional[dict]:
 # JOB PROCESSING
 # =============================================================================
 
-def process_job(job: dict):
+def process_next_job():
+    """Fetch and process one pending job. Returns True if a job was processed."""
+    job = fetch_pending_job()
+    
+    if not job:
+        return False
+    
     job_id = job["id"]
     file_path = job["file_path"]
     
@@ -366,45 +345,34 @@ def process_job(job: dict):
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         print(f"[Job] Failed: {error_msg}", flush=True)
-        print(traceback.format_exc(), flush=True)
+        traceback.print_exc()
         update_job_status(job_id, "failed", 0, error_message=error_msg)
-
-
-# =============================================================================
-# MAIN WORKER LOOP
-# =============================================================================
-
-def worker_loop():
-    """Main worker loop - runs forever, polls for jobs."""
-    print("[Worker] Starting worker loop...", flush=True)
     
+    return True
+
+
+# =============================================================================
+# MAIN - INFINITE LOOP, NO HTTP, NO SERVERS
+# =============================================================================
+
+def main():
+    print("============================================================", flush=True)
+    print("MEDIAPIPE POSE WORKER", flush=True)
+    print("============================================================", flush=True)
+    print(f"Poll interval: {POLL_INTERVAL}s", flush=True)
+    print("============================================================", flush=True)
+
     while True:
         try:
-            job = fetch_pending_job()
-            if job:
-                process_job(job)
-            else:
+            job_processed = process_next_job()
+            if not job_processed:
+                print("[Worker] No pending jobs. Sleeping 5s...", flush=True)
                 time.sleep(POLL_INTERVAL)
-        except Exception as e:
-            print(f"[Worker] Error: {e}", flush=True)
+        except Exception:
+            print("[Worker] ERROR", flush=True)
+            traceback.print_exc()
             time.sleep(POLL_INTERVAL)
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
 if __name__ == "__main__":
-    print("=" * 60, flush=True)
-    print("MEDIAPIPE POSE WORKER", flush=True)
-    print("=" * 60, flush=True)
-    print(f"Port: {PORT}", flush=True)
-    print(f"Poll interval: {POLL_INTERVAL}s", flush=True)
-    print("=" * 60, flush=True)
-    
-    # Start health check server in background thread
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    
-    # Run worker loop in main thread (blocks forever)
-    worker_loop()
+    main()
