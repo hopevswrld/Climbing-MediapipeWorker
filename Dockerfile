@@ -27,10 +27,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY server.py .
 
-# Expose port (Railway sets PORT env var)
-EXPOSE 8080
+# Railway injects PORT at runtime - we don't hardcode EXPOSE
+# The app will bind to whatever PORT Railway provides
 
-# Run the FastAPI server
-# Railway will set PORT environment variable
-CMD ["python", "server.py"]
-
+# Use SHELL FORM (not exec form) so $PORT expands at runtime
+# Railway injects PORT env var - we default to 8080 if not set
+# Running uvicorn directly ensures proper signal handling
+CMD uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}
