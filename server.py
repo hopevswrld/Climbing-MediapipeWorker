@@ -556,9 +556,15 @@ class ProcessResponse(BaseModel):
     analysis_summary: dict
 
 
+@app.get("/")
+def root():
+    """Root health check for Railway."""
+    return {"status": "ok"}
+
+
 @app.get("/health")
 async def health():
-    """Health check endpoint for Railway."""
+    """Detailed health check endpoint."""
     global worker_thread
     worker_alive = worker_thread is not None and worker_thread.is_alive()
     return {
