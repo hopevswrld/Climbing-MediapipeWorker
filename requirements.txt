@@ -1,12 +1,7 @@
-# FastAPI server
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
-pydantic==2.6.1
-
-# Supabase client (1.0.3 for stable httpx compatibility)
+# Supabase client for database and storage
 supabase==1.0.3
 
-# MediaPipe for pose estimation (CPU-only, no GPU required)
+# MediaPipe for pose estimation (CPU-only)
 mediapipe==0.10.9
 
 # OpenCV for video processing (headless for servers)

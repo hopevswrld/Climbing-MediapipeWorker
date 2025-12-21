@@ -1,10 +1,9 @@
-# Railway configuration for background worker
-# This service does NOT serve HTTP - it's a pure background worker
+[build]
+builder = "DOCKERFILE"
 
 [deploy]
-# Disable health checks entirely - this is not a web service
-numReplicas = 1
+# Explicitly set NO health check - this is a worker, not a web service
+healthcheckPath = ""
+healthcheckTimeout = 0
 restartPolicyType = "ON_FAILURE"
-
-# No health check path - worker services don't need them
-# healthcheckPath is intentionally omitted
+restartPolicyMaxRetries = 10
