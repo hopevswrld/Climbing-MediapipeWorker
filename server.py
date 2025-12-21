@@ -1,12 +1,18 @@
 """
 Minimal MediaPipe Pose Worker for Railway
 Processes videos from Supabase Storage and outputs pose analysis JSON.
+Includes background worker that polls analysis_videos table for pending jobs.
 """
 import os
 import json
 import math
 import tempfile
+import threading
+import time
+import traceback
 from typing import Optional
+from contextlib import asynccontextmanager
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -20,6 +26,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 TARGET_FPS = 10  # Sample rate for frame extraction
 KEYFRAME_ANGLE_DELTA = 20  # Degrees threshold for keyframe detection
 STRAIGHT_ARM_THRESHOLD = 160  # Degrees for "straight arm" classification
+POLL_INTERVAL = 5  # Seconds between polling for new jobs
 
 # --- Initialize Supabase client ---
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -40,21 +47,8 @@ LANDMARK_NAMES = [
     "left_foot_index", "right_foot_index"
 ]
 
-# --- FastAPI app ---
-app = FastAPI(title="MediaPipe Pose Worker")
-
-
-class ProcessRequest(BaseModel):
-    bucket: str
-    path: str
-
-
-class ProcessResponse(BaseModel):
-    video_path: str
-    video_metadata: dict
-    pose_sequence: list
-    keyframes: list
-    analysis_summary: dict
+# --- Background worker control ---
+worker_running = True
 
 
 def calculate_angle(p1: dict, p2: dict, p3: dict) -> Optional[float]:
@@ -349,17 +343,184 @@ def process_video(video_path: str) -> dict:
     }
 
 
+# =============================================================================
+# BACKGROUND WORKER - Polls analysis_videos table for pending jobs
+# =============================================================================
+
+def update_job_status(job_id: str, status: str, progress: int, 
+                      analysis_result: dict = None, error_message: str = None):
+    """
+    Update the status of a job in the analysis_videos table.
+    """
+    update_data = {
+        "status": status,
+        "progress": progress,
+        "updated_at": "now()"
+    }
+    
+    if analysis_result is not None:
+        update_data["analysis_result"] = analysis_result
+    
+    if error_message is not None:
+        update_data["error_message"] = error_message
+    
+    try:
+        supabase.table("analysis_videos").update(update_data).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"[Worker] Failed to update job {job_id}: {e}")
+
+
+def process_pending_job(job: dict):
+    """
+    Process a single pending job from the analysis_videos table.
+    Downloads video, runs pose analysis, updates database with results.
+    """
+    job_id = job["id"]
+    file_path = job["file_path"]
+    
+    print(f"[Worker] Processing job {job_id}: {file_path}")
+    
+    # Step 1: Mark as processing with progress = 5
+    update_job_status(job_id, "processing", 5)
+    
+    try:
+        # Step 2: Download video from Supabase Storage
+        update_job_status(job_id, "processing", 10)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract filename from path
+            filename = file_path.split("/")[-1] if "/" in file_path else file_path
+            local_video_path = os.path.join(tmpdir, filename)
+            
+            # Download from analysis-videos bucket
+            print(f"[Worker] Downloading video: {file_path}")
+            response = supabase.storage.from_("analysis-videos").download(file_path)
+            with open(local_video_path, "wb") as f:
+                f.write(response)
+            
+            update_job_status(job_id, "processing", 20)
+            
+            # Step 3: Process video with MediaPipe
+            print(f"[Worker] Running pose analysis...")
+            update_job_status(job_id, "processing", 40)
+            
+            result = process_video(local_video_path)
+            
+            update_job_status(job_id, "processing", 70)
+            
+            # Add metadata to result
+            result["video_path"] = file_path
+            result["job_id"] = job_id
+            
+            update_job_status(job_id, "processing", 90)
+            
+            # Step 4: Mark as completed with full result
+            print(f"[Worker] Job {job_id} completed successfully")
+            update_job_status(job_id, "completed", 100, analysis_result=result)
+    
+    except Exception as e:
+        # Step 5: On error, mark as failed
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"[Worker] Job {job_id} failed: {error_msg}")
+        print(traceback.format_exc())
+        update_job_status(job_id, "failed", 0, error_message=error_msg)
+
+
+def background_worker_loop():
+    """
+    Background worker loop that continuously polls for pending jobs.
+    Runs in a separate thread, started when the FastAPI app starts.
+    """
+    global worker_running
+    
+    print("[Worker] Background worker started")
+    
+    while worker_running:
+        try:
+            # Query for ONE pending job, ordered by created_at (oldest first)
+            response = (
+                supabase.table("analysis_videos")
+                .select("*")
+                .eq("status", "pending")
+                .order("created_at", desc=False)
+                .limit(1)
+                .execute()
+            )
+            
+            jobs = response.data
+            
+            if not jobs:
+                # No pending jobs, sleep and continue
+                time.sleep(POLL_INTERVAL)
+                continue
+            
+            # Process the found job
+            job = jobs[0]
+            process_pending_job(job)
+        
+        except Exception as e:
+            # Log error but keep the worker running
+            print(f"[Worker] Error in worker loop: {e}")
+            print(traceback.format_exc())
+            time.sleep(POLL_INTERVAL)
+    
+    print("[Worker] Background worker stopped")
+
+
+# =============================================================================
+# FASTAPI APP WITH LIFESPAN
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan context manager.
+    Starts background worker on startup, stops it on shutdown.
+    """
+    global worker_running
+    
+    # Startup: Start the background worker thread
+    worker_running = True
+    worker_thread = threading.Thread(target=background_worker_loop, daemon=True)
+    worker_thread.start()
+    print("[App] FastAPI started, background worker running")
+    
+    yield
+    
+    # Shutdown: Signal the worker to stop
+    worker_running = False
+    print("[App] FastAPI shutting down, stopping worker...")
+
+
+# --- FastAPI app with lifespan ---
+app = FastAPI(title="MediaPipe Pose Worker", lifespan=lifespan)
+
+
+class ProcessRequest(BaseModel):
+    bucket: str
+    path: str
+
+
+class ProcessResponse(BaseModel):
+    video_path: str
+    video_metadata: dict
+    pose_sequence: list
+    keyframes: list
+    analysis_summary: dict
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint for Railway."""
-    return {"status": "healthy"}
+    return {"status": "healthy", "worker_running": worker_running}
 
 
 @app.post("/process", response_model=ProcessResponse)
 async def process_endpoint(request: ProcessRequest):
     """
-    Process a video from Supabase Storage.
+    Manual endpoint to process a video from Supabase Storage.
     Downloads video, runs MediaPipe Pose, uploads JSON result.
+    Note: The background worker handles automatic processing from the database.
     """
     bucket = request.bucket
     path = request.path
@@ -423,4 +584,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
