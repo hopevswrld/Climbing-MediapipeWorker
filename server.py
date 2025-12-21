@@ -1,25 +1,16 @@
 """
 MediaPipe Pose Analysis Worker for Railway
 
-This is a PURE BACKGROUND WORKER - no HTTP, no web server, no health checks.
-It runs as an infinite loop that:
-1. Polls the `analysis_videos` table for pending jobs
-2. Downloads videos from Supabase Storage
-3. Runs MediaPipe pose analysis
-4. Writes results back to the database
-
-Railway Configuration:
-- This should be deployed as a "Worker" service, NOT a "Web" service
-- No public domain needed
-- No PORT needed
+Background worker with a minimal HTTP health check to satisfy Railway.
 """
 
 import os
-import json
 import math
 import tempfile
 import time
 import traceback
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 import cv2
@@ -34,11 +25,12 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+PORT = int(os.environ.get("PORT", 8080))
 
-TARGET_FPS = 10  # Sample rate for frame extraction
-KEYFRAME_ANGLE_DELTA = 20  # Degrees threshold for keyframe detection
-STRAIGHT_ARM_THRESHOLD = 160  # Degrees for "straight arm" classification
-POLL_INTERVAL = 5  # Seconds between polling for new jobs
+TARGET_FPS = 10
+KEYFRAME_ANGLE_DELTA = 20
+STRAIGHT_ARM_THRESHOLD = 160
+POLL_INTERVAL = 5
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -46,7 +38,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
 
-# Landmark name mapping (MediaPipe index -> name)
 LANDMARK_NAMES = [
     "nose", "left_eye_inner", "left_eye", "left_eye_outer",
     "right_eye_inner", "right_eye", "right_eye_outer",
@@ -61,23 +52,45 @@ LANDMARK_NAMES = [
 
 
 # =============================================================================
+# MINIMAL HEALTH CHECK SERVER
+# =============================================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler that responds to health checks."""
+    
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+    
+    def log_message(self, format, *args):
+        # Suppress default logging
+        pass
+
+
+def start_health_server():
+    """Start a minimal HTTP server for Railway health checks."""
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"[Health] Server listening on port {PORT}", flush=True)
+    server.serve_forever()
+
+
+# =============================================================================
 # MEDIAPIPE PROCESSING FUNCTIONS
 # =============================================================================
 
 def calculate_angle(p1: dict, p2: dict, p3: dict) -> Optional[float]:
-    """Calculate angle at p2 formed by p1-p2-p3. Returns degrees or None."""
     if not all(p.get("confident", False) for p in [p1, p2, p3]):
         return None
     v1 = np.array([p1["x"] - p2["x"], p1["y"] - p2["y"], p1["z"] - p2["z"]])
     v2 = np.array([p3["x"] - p2["x"], p3["y"] - p2["y"], p3["z"] - p2["z"]])
     cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
     cos_angle = np.clip(cos_angle, -1.0, 1.0)
-    angle = math.degrees(math.acos(cos_angle))
-    return round(angle, 1)
+    return round(math.degrees(math.acos(cos_angle)), 1)
 
 
 def extract_landmarks(results) -> Optional[dict]:
-    """Extract landmarks from MediaPipe results into a dictionary."""
     if not results.pose_landmarks:
         return None
     landmarks = {}
@@ -94,7 +107,6 @@ def extract_landmarks(results) -> Optional[dict]:
 
 
 def compute_metrics(landmarks: dict) -> dict:
-    """Compute per-frame metrics from landmarks."""
     left_hip = landmarks.get("left_hip", {})
     right_hip = landmarks.get("right_hip", {})
     
@@ -132,14 +144,6 @@ def compute_metrics(landmarks: dict) -> dict:
     
     left_ankle = landmarks.get("left_ankle", {})
     right_ankle = landmarks.get("right_ankle", {})
-    left_foot_position = {
-        "relative_x": round(left_ankle.get("x", 0) - center_of_mass["x"], 4),
-        "relative_y": round(left_ankle.get("y", 0) - center_of_mass["y"], 4)
-    }
-    right_foot_position = {
-        "relative_x": round(right_ankle.get("x", 0) - center_of_mass["x"], 4),
-        "relative_y": round(right_ankle.get("y", 0) - center_of_mass["y"], 4)
-    }
     
     return {
         "center_of_mass": center_of_mass,
@@ -149,27 +153,30 @@ def compute_metrics(landmarks: dict) -> dict:
         "left_leg_angle": left_leg_angle,
         "right_leg_angle": right_leg_angle,
         "hip_angle": hip_angle,
-        "left_foot_position": left_foot_position,
-        "right_foot_position": right_foot_position
+        "left_foot_position": {
+            "relative_x": round(left_ankle.get("x", 0) - center_of_mass["x"], 4),
+            "relative_y": round(left_ankle.get("y", 0) - center_of_mass["y"], 4)
+        },
+        "right_foot_position": {
+            "relative_x": round(right_ankle.get("x", 0) - center_of_mass["x"], 4),
+            "relative_y": round(right_ankle.get("y", 0) - center_of_mass["y"], 4)
+        }
     }
 
 
 def detect_keyframes(pose_sequence: list) -> list:
-    """Detect keyframes based on right_arm_angle deltas > threshold."""
     keyframes = []
     prev_angle = None
     for frame in pose_sequence:
         current_angle = frame.get("metrics", {}).get("right_arm_angle")
         if current_angle is not None and prev_angle is not None:
-            delta = abs(current_angle - prev_angle)
-            if delta > KEYFRAME_ANGLE_DELTA:
+            if abs(current_angle - prev_angle) > KEYFRAME_ANGLE_DELTA:
                 keyframes.append(frame["frame_index"])
         prev_angle = current_angle if current_angle is not None else prev_angle
     return keyframes
 
 
 def compute_analysis_summary(pose_sequence: list) -> dict:
-    """Compute aggregate analysis metrics from pose sequence."""
     total_frames = len(pose_sequence)
     frames_with_pose = sum(1 for f in pose_sequence if f.get("landmarks"))
     
@@ -224,7 +231,6 @@ def compute_analysis_summary(pose_sequence: list) -> dict:
 
 
 def process_video(video_path: str) -> dict:
-    """Process video file and extract pose data."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
@@ -267,14 +273,13 @@ def process_video(video_path: str) -> dict:
                 landmarks = extract_landmarks(results)
                 metrics = compute_metrics(landmarks) if landmarks else {}
                 timestamp_ms = int((frame_idx / fps) * 1000) if fps > 0 else 0
-                frame_data = {
+                pose_sequence.append({
                     "frame_index": frame_idx,
                     "timestamp_ms": timestamp_ms,
                     "landmarks": landmarks,
                     "metrics": metrics,
                     "segmentation_available": False
-                }
-                pose_sequence.append(frame_data)
+                })
             frame_idx += 1
     
     cap.release()
@@ -282,14 +287,11 @@ def process_video(video_path: str) -> dict:
     video_metadata["processed_frames"] = len([f for f in pose_sequence if f["landmarks"]])
     video_metadata["sampled_frames"] = len(pose_sequence)
     
-    keyframes = detect_keyframes(pose_sequence)
-    analysis_summary = compute_analysis_summary(pose_sequence)
-    
     return {
         "video_metadata": video_metadata,
         "pose_sequence": pose_sequence,
-        "keyframes": keyframes,
-        "analysis_summary": analysis_summary
+        "keyframes": detect_keyframes(pose_sequence),
+        "analysis_summary": compute_analysis_summary(pose_sequence)
     }
 
 
@@ -299,11 +301,7 @@ def process_video(video_path: str) -> dict:
 
 def update_job_status(job_id: str, status: str, progress: int,
                       analysis_result: dict = None, error_message: str = None):
-    """Update the status of a job in the analysis_videos table."""
-    update_data = {
-        "status": status,
-        "progress": progress,
-    }
+    update_data = {"status": status, "progress": progress}
     if analysis_result is not None:
         update_data["analysis_result"] = analysis_result
     if error_message is not None:
@@ -311,13 +309,12 @@ def update_job_status(job_id: str, status: str, progress: int,
     
     try:
         supabase.table("analysis_videos").update(update_data).eq("id", job_id).execute()
-        print(f"[DB] Updated job {job_id}: status={status}, progress={progress}", flush=True)
+        print(f"[DB] Job {job_id}: status={status}, progress={progress}", flush=True)
     except Exception as e:
         print(f"[DB] Failed to update job {job_id}: {e}", flush=True)
 
 
 def fetch_pending_job() -> Optional[dict]:
-    """Fetch the oldest pending job from the database."""
     try:
         response = (
             supabase.table("analysis_videos")
@@ -327,10 +324,9 @@ def fetch_pending_job() -> Optional[dict]:
             .limit(1)
             .execute()
         )
-        jobs = response.data
-        return jobs[0] if jobs else None
+        return response.data[0] if response.data else None
     except Exception as e:
-        print(f"[DB] Error fetching pending job: {e}", flush=True)
+        print(f"[DB] Error fetching job: {e}", flush=True)
         return None
 
 
@@ -339,56 +335,37 @@ def fetch_pending_job() -> Optional[dict]:
 # =============================================================================
 
 def process_job(job: dict):
-    """
-    Process a single job from the analysis_videos table.
-    Downloads video, runs pose analysis, updates database with results.
-    """
     job_id = job["id"]
     file_path = job["file_path"]
     
-    print(f"[Job] Starting job {job_id}", flush=True)
-    print(f"[Job] File path: {file_path}", flush=True)
-    
-    # Mark as processing
+    print(f"[Job] Starting: {job_id}", flush=True)
     update_job_status(job_id, "processing", 5)
     
     try:
-        # Download video from Supabase Storage
         print(f"[Job] Downloading video...", flush=True)
         update_job_status(job_id, "processing", 10)
         
         with tempfile.TemporaryDirectory() as tmpdir:
             filename = file_path.split("/")[-1] if "/" in file_path else file_path
-            local_video_path = os.path.join(tmpdir, filename)
+            local_path = os.path.join(tmpdir, filename)
             
             response = supabase.storage.from_("analysis-videos").download(file_path)
-            with open(local_video_path, "wb") as f:
+            with open(local_path, "wb") as f:
                 f.write(response)
             
-            print(f"[Job] Video downloaded to {local_video_path}", flush=True)
-            update_job_status(job_id, "processing", 20)
-            
-            # Run MediaPipe pose analysis
-            print(f"[Job] Running pose analysis...", flush=True)
+            print(f"[Job] Running analysis...", flush=True)
             update_job_status(job_id, "processing", 30)
             
-            result = process_video(local_video_path)
-            
-            update_job_status(job_id, "processing", 80)
-            
-            # Add metadata to result
+            result = process_video(local_path)
             result["video_path"] = file_path
             result["job_id"] = job_id
             
-            # Mark as completed with results
-            print(f"[Job] Analysis complete. Frames processed: {result['video_metadata']['processed_frames']}", flush=True)
             update_job_status(job_id, "completed", 100, analysis_result=result)
-            print(f"[Job] Job {job_id} completed successfully", flush=True)
+            print(f"[Job] Completed: {job_id}", flush=True)
     
     except Exception as e:
-        # Mark as failed with error message
         error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"[Job] Job {job_id} failed: {error_msg}", flush=True)
+        print(f"[Job] Failed: {error_msg}", flush=True)
         print(traceback.format_exc(), flush=True)
         update_job_status(job_id, "failed", 0, error_message=error_msg)
 
@@ -397,51 +374,20 @@ def process_job(job: dict):
 # MAIN WORKER LOOP
 # =============================================================================
 
-def run_worker():
-    """
-    Main worker loop. Runs forever, polling for pending jobs.
-    
-    This is a BLOCKING infinite loop that:
-    1. Checks for pending jobs in the database
-    2. If found, processes ONE job
-    3. If not found, sleeps for POLL_INTERVAL seconds
-    4. Repeats forever
-    
-    The process never exits. Railway will keep it running as a background worker.
-    """
-    print("=" * 60, flush=True)
-    print("MEDIAPIPE POSE ANALYSIS WORKER", flush=True)
-    print("=" * 60, flush=True)
-    print(f"Poll interval: {POLL_INTERVAL} seconds", flush=True)
-    print(f"Supabase URL: {SUPABASE_URL[:50]}...", flush=True)
-    print("Worker starting...", flush=True)
-    print("=" * 60, flush=True)
+def worker_loop():
+    """Main worker loop - runs forever, polls for jobs."""
+    print("[Worker] Starting worker loop...", flush=True)
     
     while True:
         try:
-            # Fetch the next pending job
             job = fetch_pending_job()
-            
             if job:
-                # Process the job
                 process_job(job)
             else:
-                # No pending jobs, wait before polling again
-                print(f"[Worker] No pending jobs. Sleeping {POLL_INTERVAL}s...", flush=True)
                 time.sleep(POLL_INTERVAL)
-        
-        except KeyboardInterrupt:
-            print("[Worker] Received interrupt signal. Exiting...", flush=True)
-            break
-        
         except Exception as e:
-            # Log unexpected errors but keep running
-            print(f"[Worker] Unexpected error: {e}", flush=True)
-            print(traceback.format_exc(), flush=True)
-            print(f"[Worker] Sleeping {POLL_INTERVAL}s before retry...", flush=True)
+            print(f"[Worker] Error: {e}", flush=True)
             time.sleep(POLL_INTERVAL)
-    
-    print("[Worker] Worker stopped.", flush=True)
 
 
 # =============================================================================
@@ -449,12 +395,16 @@ def run_worker():
 # =============================================================================
 
 if __name__ == "__main__":
-    """
-    Entry point for the worker.
+    print("=" * 60, flush=True)
+    print("MEDIAPIPE POSE WORKER", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Port: {PORT}", flush=True)
+    print(f"Poll interval: {POLL_INTERVAL}s", flush=True)
+    print("=" * 60, flush=True)
     
-    This script runs a single blocking infinite loop.
-    No HTTP server, no ports, no health checks.
+    # Start health check server in background thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
     
-    Railway should run this as a "Worker" service, not a "Web" service.
-    """
-    run_worker()
+    # Run worker loop in main thread (blocks forever)
+    worker_loop()

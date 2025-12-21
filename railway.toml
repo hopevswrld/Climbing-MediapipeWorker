@@ -2,8 +2,7 @@
 builder = "DOCKERFILE"
 
 [deploy]
-# Explicitly set NO health check - this is a worker, not a web service
-healthcheckPath = ""
-healthcheckTimeout = 0
+healthcheckPath = "/"
+healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

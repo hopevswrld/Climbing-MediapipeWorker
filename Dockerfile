@@ -1,5 +1,5 @@
 # MediaPipe Pose Worker for Railway
-# Pure background worker - NO HTTP, NO PORTS
+# Background worker with minimal health check endpoint
 
 FROM python:3.11-slim
 
@@ -16,14 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for layer caching
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
 COPY server.py .
 
-# Run the worker script directly - no web server
+# Default port (Railway overrides via $PORT)
+ENV PORT=8080
+
 CMD ["python", "-u", "server.py"]
