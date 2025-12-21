@@ -1,7 +1,13 @@
 """
 Minimal MediaPipe Pose Worker for Railway
 Processes videos from Supabase Storage and outputs pose analysis JSON.
-Includes background worker that polls analysis_videos table for pending jobs.
+
+IMPORTANT - LIFECYCLE NOTES:
+- The background worker runs in a NON-DAEMON thread
+- Non-daemon threads keep the Python process alive until they complete
+- Daemon threads (daemon=True) do NOT keep the process alive - they are killed when main exits
+- We use @app.on_event("startup") instead of lifespan to avoid early exit issues
+- The worker thread runs an infinite loop, so the process stays alive indefinitely
 """
 import os
 import json
@@ -11,7 +17,6 @@ import threading
 import time
 import traceback
 from typing import Optional
-from contextlib import asynccontextmanager
 
 import cv2
 import mediapipe as mp
@@ -47,8 +52,11 @@ LANDMARK_NAMES = [
     "left_foot_index", "right_foot_index"
 ]
 
-# --- Background worker control ---
-worker_running = True
+# --- FastAPI app (no lifespan - we use on_event instead) ---
+app = FastAPI(title="MediaPipe Pose Worker")
+
+# --- Worker thread reference (kept globally so we can check status) ---
+worker_thread: Optional[threading.Thread] = None
 
 
 def calculate_angle(p1: dict, p2: dict, p3: dict) -> Optional[float]:
@@ -426,75 +434,114 @@ def process_pending_job(job: dict):
         update_job_status(job_id, "failed", 0, error_message=error_msg)
 
 
+def process_next_job() -> bool:
+    """
+    Query for the next pending job and process it.
+    Returns True if a job was found and processed, False otherwise.
+    """
+    try:
+        # Query for ONE pending job, ordered by created_at (oldest first)
+        response = (
+            supabase.table("analysis_videos")
+            .select("*")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        
+        jobs = response.data
+        
+        if not jobs:
+            return False
+        
+        # Process the found job
+        job = jobs[0]
+        process_pending_job(job)
+        return True
+    
+    except Exception as e:
+        print(f"[Worker] Error querying for jobs: {e}")
+        print(traceback.format_exc())
+        return False
+
+
 def background_worker_loop():
     """
     Background worker loop that continuously polls for pending jobs.
-    Runs in a separate thread, started when the FastAPI app starts.
+    
+    WHY THIS KEEPS THE PROCESS ALIVE:
+    - This runs in a NON-DAEMON thread (daemon=False)
+    - Python will NOT exit while non-daemon threads are running
+    - The infinite loop means this thread never completes
+    - Therefore, the process stays alive indefinitely
+    
+    WHY WE REMOVED DAEMON THREADS:
+    - Daemon threads (daemon=True) are killed when the main thread exits
+    - With lifespan context + daemon thread, the main thread could exit after startup
+    - This caused Railway to see the process exit cleanly after a few seconds
+    - Non-daemon threads prevent this by keeping the process alive
     """
-    global worker_running
+    print("[Worker] Background worker started (non-daemon thread)")
+    print("[Worker] This thread will keep the process alive indefinitely")
     
-    print("[Worker] Background worker started")
-    
-    while worker_running:
+    while True:
         try:
-            # Query for ONE pending job, ordered by created_at (oldest first)
-            response = (
-                supabase.table("analysis_videos")
-                .select("*")
-                .eq("status", "pending")
-                .order("created_at", desc=False)
-                .limit(1)
-                .execute()
-            )
+            # Try to process the next pending job
+            job_found = process_next_job()
             
-            jobs = response.data
-            
-            if not jobs:
-                # No pending jobs, sleep and continue
+            if not job_found:
+                # No pending jobs, wait before polling again
                 time.sleep(POLL_INTERVAL)
-                continue
-            
-            # Process the found job
-            job = jobs[0]
-            process_pending_job(job)
         
         except Exception as e:
-            # Log error but keep the worker running
-            print(f"[Worker] Error in worker loop: {e}")
+            # Log error but keep the worker running - never crash
+            print(f"[Worker] Unexpected error in worker loop: {e}")
             print(traceback.format_exc())
             time.sleep(POLL_INTERVAL)
-    
-    print("[Worker] Background worker stopped")
 
 
 # =============================================================================
-# FASTAPI APP WITH LIFESPAN
+# FASTAPI STARTUP EVENT - Starts the background worker
 # =============================================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+@app.on_event("startup")
+def startup_event():
     """
-    FastAPI lifespan context manager.
-    Starts background worker on startup, stops it on shutdown.
-    """
-    global worker_running
+    FastAPI startup event handler.
     
-    # Startup: Start the background worker thread
-    worker_running = True
-    worker_thread = threading.Thread(target=background_worker_loop, daemon=True)
+    Starts the background worker in a NON-DAEMON thread.
+    
+    WHY NON-DAEMON (daemon=False):
+    - Non-daemon threads keep the Python process alive
+    - The process will not exit until all non-daemon threads complete
+    - Since our worker loop is infinite, the process runs forever
+    
+    WHY NOT LIFESPAN:
+    - Lifespan context managers can have subtle exit timing issues
+    - The on_event("startup") pattern is simpler and more reliable
+    - The worker thread starts and the process stays alive
+    """
+    global worker_thread
+    
+    print("[Startup] Starting background worker thread...")
+    
+    # Create NON-DAEMON thread (daemon=False is the default, but we're explicit)
+    # This is critical: non-daemon threads keep the process alive!
+    worker_thread = threading.Thread(
+        target=background_worker_loop,
+        name="PoseAnalysisWorker",
+        daemon=False  # IMPORTANT: Non-daemon keeps process alive!
+    )
     worker_thread.start()
-    print("[App] FastAPI started, background worker running")
     
-    yield
-    
-    # Shutdown: Signal the worker to stop
-    worker_running = False
-    print("[App] FastAPI shutting down, stopping worker...")
+    print("[Startup] Background worker thread started successfully")
+    print("[Startup] Process will stay alive as long as worker thread runs")
 
 
-# --- FastAPI app with lifespan ---
-app = FastAPI(title="MediaPipe Pose Worker", lifespan=lifespan)
-
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
 
 class ProcessRequest(BaseModel):
     bucket: str
@@ -512,7 +559,13 @@ class ProcessResponse(BaseModel):
 @app.get("/health")
 async def health():
     """Health check endpoint for Railway."""
-    return {"status": "healthy", "worker_running": worker_running}
+    global worker_thread
+    worker_alive = worker_thread is not None and worker_thread.is_alive()
+    return {
+        "status": "healthy",
+        "worker_running": worker_alive,
+        "worker_thread_name": worker_thread.name if worker_thread else None
+    }
 
 
 @app.post("/process", response_model=ProcessResponse)
