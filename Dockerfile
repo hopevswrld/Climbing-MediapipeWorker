@@ -27,11 +27,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY server.py .
 
-# Railway injects PORT at runtime - we don't hardcode EXPOSE
-# The app will bind to whatever PORT Railway provides
+# Default PORT for local dev (Railway overrides this)
+ENV PORT=8080
 
-# Use SHELL FORM (not exec form) so $PORT expands at runtime
-# Railway injects PORT env var - we default to 8080 if not set
-# Running uvicorn directly ensures proper signal handling
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT}"]
-
+# Use Python to run - it reads PORT from os.environ reliably
+CMD ["python", "server.py"]

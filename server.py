@@ -642,4 +642,6 @@ async def process_endpoint(request: ProcessRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
+    print(f"[Main] Starting uvicorn on port {port}")
+    print(f"[Main] PORT env var = {os.environ.get('PORT', 'NOT SET')}")
     uvicorn.run(app, host="0.0.0.0", port=port)
