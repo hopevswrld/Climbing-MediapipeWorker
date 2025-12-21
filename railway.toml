@@ -1,10 +1,10 @@
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+# Railway configuration for background worker
+# This service does NOT serve HTTP - it's a pure background worker
 
 [deploy]
-healthcheckPath = "/"
-healthcheckTimeout = 300
+# Disable health checks entirely - this is not a web service
+numReplicas = 1
 restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 3
 
+# No health check path - worker services don't need them
+# healthcheckPath is intentionally omitted
