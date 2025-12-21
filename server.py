@@ -1,14 +1,23 @@
 """
-Minimal MediaPipe Pose Worker for Railway
-Processes videos from Supabase Storage and outputs pose analysis JSON.
+MediaPipe Pose Analysis Worker for Railway
 
-LIFECYCLE: Background worker runs in a non-daemon thread to keep process alive.
+This is a PURE BACKGROUND WORKER - no HTTP, no web server, no health checks.
+It runs as an infinite loop that:
+1. Polls the `analysis_videos` table for pending jobs
+2. Downloads videos from Supabase Storage
+3. Runs MediaPipe pose analysis
+4. Writes results back to the database
+
+Railway Configuration:
+- This should be deployed as a "Worker" service, NOT a "Web" service
+- No public domain needed
+- No PORT needed
 """
+
 import os
 import json
 import math
 import tempfile
-import threading
 import time
 import traceback
 from typing import Optional
@@ -16,27 +25,28 @@ from typing import Optional
 import cv2
 import mediapipe as mp
 import numpy as np
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from supabase import create_client, Client
 
-# --- Configuration ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-TARGET_FPS = 10
-KEYFRAME_ANGLE_DELTA = 20
-STRAIGHT_ARM_THRESHOLD = 160
-POLL_INTERVAL = 5
 
-# --- Initialize Supabase client (only if credentials exist) ---
-supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-# --- Initialize MediaPipe Pose ---
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+TARGET_FPS = 10  # Sample rate for frame extraction
+KEYFRAME_ANGLE_DELTA = 20  # Degrees threshold for keyframe detection
+STRAIGHT_ARM_THRESHOLD = 160  # Degrees for "straight arm" classification
+POLL_INTERVAL = 5  # Seconds between polling for new jobs
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
 
-# --- Landmark name mapping ---
+# Landmark name mapping (MediaPipe index -> name)
 LANDMARK_NAMES = [
     "nose", "left_eye_inner", "left_eye", "left_eye_outer",
     "right_eye_inner", "right_eye", "right_eye_outer",
@@ -49,14 +59,13 @@ LANDMARK_NAMES = [
     "left_foot_index", "right_foot_index"
 ]
 
-# --- FastAPI app ---
-app = FastAPI(title="MediaPipe Pose Worker")
 
-# --- Worker thread reference ---
-worker_thread: Optional[threading.Thread] = None
-
+# =============================================================================
+# MEDIAPIPE PROCESSING FUNCTIONS
+# =============================================================================
 
 def calculate_angle(p1: dict, p2: dict, p3: dict) -> Optional[float]:
+    """Calculate angle at p2 formed by p1-p2-p3. Returns degrees or None."""
     if not all(p.get("confident", False) for p in [p1, p2, p3]):
         return None
     v1 = np.array([p1["x"] - p2["x"], p1["y"] - p2["y"], p1["z"] - p2["z"]])
@@ -68,6 +77,7 @@ def calculate_angle(p1: dict, p2: dict, p3: dict) -> Optional[float]:
 
 
 def extract_landmarks(results) -> Optional[dict]:
+    """Extract landmarks from MediaPipe results into a dictionary."""
     if not results.pose_landmarks:
         return None
     landmarks = {}
@@ -84,13 +94,16 @@ def extract_landmarks(results) -> Optional[dict]:
 
 
 def compute_metrics(landmarks: dict) -> dict:
+    """Compute per-frame metrics from landmarks."""
     left_hip = landmarks.get("left_hip", {})
     right_hip = landmarks.get("right_hip", {})
+    
     center_of_mass = {
         "x": round((left_hip.get("x", 0) + right_hip.get("x", 0)) / 2, 4),
         "y": round((left_hip.get("y", 0) + right_hip.get("y", 0)) / 2, 4)
     }
     hip_depth = round((left_hip.get("z", 0) + right_hip.get("z", 0)) / 2, 4)
+    
     left_arm_angle = calculate_angle(
         landmarks.get("left_shoulder", {}),
         landmarks.get("left_elbow", {}),
@@ -116,6 +129,7 @@ def compute_metrics(landmarks: dict) -> dict:
         landmarks.get("right_hip", {}),
         landmarks.get("right_knee", {})
     )
+    
     left_ankle = landmarks.get("left_ankle", {})
     right_ankle = landmarks.get("right_ankle", {})
     left_foot_position = {
@@ -126,6 +140,7 @@ def compute_metrics(landmarks: dict) -> dict:
         "relative_x": round(right_ankle.get("x", 0) - center_of_mass["x"], 4),
         "relative_y": round(right_ankle.get("y", 0) - center_of_mass["y"], 4)
     }
+    
     return {
         "center_of_mass": center_of_mass,
         "hip_depth": hip_depth,
@@ -140,6 +155,7 @@ def compute_metrics(landmarks: dict) -> dict:
 
 
 def detect_keyframes(pose_sequence: list) -> list:
+    """Detect keyframes based on right_arm_angle deltas > threshold."""
     keyframes = []
     prev_angle = None
     for frame in pose_sequence:
@@ -153,24 +169,25 @@ def detect_keyframes(pose_sequence: list) -> list:
 
 
 def compute_analysis_summary(pose_sequence: list) -> dict:
+    """Compute aggregate analysis metrics from pose sequence."""
     total_frames = len(pose_sequence)
     frames_with_pose = sum(1 for f in pose_sequence if f.get("landmarks"))
-    arm_angles = []
-    for frame in pose_sequence:
-        angle = frame.get("metrics", {}).get("right_arm_angle")
-        if angle is not None:
-            arm_angles.append(angle)
+    
+    arm_angles = [f.get("metrics", {}).get("right_arm_angle") 
+                  for f in pose_sequence 
+                  if f.get("metrics", {}).get("right_arm_angle") is not None]
+    
     leg_angles = []
     for frame in pose_sequence:
         for key in ["left_leg_angle", "right_leg_angle"]:
             angle = frame.get("metrics", {}).get(key)
             if angle is not None:
                 leg_angles.append(angle)
-    hip_depths = []
-    for frame in pose_sequence:
-        depth = frame.get("metrics", {}).get("hip_depth")
-        if depth is not None:
-            hip_depths.append(depth)
+    
+    hip_depths = [f.get("metrics", {}).get("hip_depth") 
+                  for f in pose_sequence 
+                  if f.get("metrics", {}).get("hip_depth") is not None]
+    
     arm_extension = {}
     if arm_angles:
         straight_count = sum(1 for a in arm_angles if a >= STRAIGHT_ARM_THRESHOLD)
@@ -180,6 +197,7 @@ def compute_analysis_summary(pose_sequence: list) -> dict:
             "max": round(max(arm_angles), 1),
             "straight_arm_percentage": round(100 * straight_count / len(arm_angles), 1)
         }
+    
     leg_extension = {}
     if leg_angles:
         leg_extension = {
@@ -187,6 +205,7 @@ def compute_analysis_summary(pose_sequence: list) -> dict:
             "min": round(min(leg_angles), 1),
             "max": round(max(leg_angles), 1)
         }
+    
     hip_to_wall = {}
     if hip_depths:
         hip_to_wall = {
@@ -194,6 +213,7 @@ def compute_analysis_summary(pose_sequence: list) -> dict:
             "min": round(min(hip_depths), 4),
             "max": round(max(hip_depths), 4)
         }
+    
     return {
         "total_frames_with_pose": frames_with_pose,
         "detection_rate": round(100 * frames_with_pose / total_frames, 1) if total_frames > 0 else 0,
@@ -204,15 +224,18 @@ def compute_analysis_summary(pose_sequence: list) -> dict:
 
 
 def process_video(video_path: str) -> dict:
+    """Process video file and extract pose data."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
+    
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_seconds = total_frames / fps if fps > 0 else 0
     frame_interval = max(1, int(fps / TARGET_FPS))
+    
     video_metadata = {
         "width": width,
         "height": height,
@@ -223,7 +246,9 @@ def process_video(video_path: str) -> dict:
         "sampled_frames": 0,
         "target_fps": TARGET_FPS
     }
+    
     pose_sequence = []
+    
     with mp_pose.Pose(
         static_image_mode=False,
         model_complexity=1,
@@ -251,11 +276,15 @@ def process_video(video_path: str) -> dict:
                 }
                 pose_sequence.append(frame_data)
             frame_idx += 1
+    
     cap.release()
+    
     video_metadata["processed_frames"] = len([f for f in pose_sequence if f["landmarks"]])
     video_metadata["sampled_frames"] = len(pose_sequence)
+    
     keyframes = detect_keyframes(pose_sequence)
     analysis_summary = compute_analysis_summary(pose_sequence)
+    
     return {
         "video_metadata": video_metadata,
         "pose_sequence": pose_sequence,
@@ -265,62 +294,30 @@ def process_video(video_path: str) -> dict:
 
 
 # =============================================================================
-# BACKGROUND WORKER
+# DATABASE OPERATIONS
 # =============================================================================
 
-def update_job_status(job_id: str, status: str, progress: int, 
+def update_job_status(job_id: str, status: str, progress: int,
                       analysis_result: dict = None, error_message: str = None):
-    if not supabase:
-        return
+    """Update the status of a job in the analysis_videos table."""
     update_data = {
         "status": status,
         "progress": progress,
-        "updated_at": "now()"
     }
     if analysis_result is not None:
         update_data["analysis_result"] = analysis_result
     if error_message is not None:
         update_data["error_message"] = error_message
+    
     try:
         supabase.table("analysis_videos").update(update_data).eq("id", job_id).execute()
+        print(f"[DB] Updated job {job_id}: status={status}, progress={progress}", flush=True)
     except Exception as e:
-        print(f"[Worker] Failed to update job {job_id}: {e}", flush=True)
+        print(f"[DB] Failed to update job {job_id}: {e}", flush=True)
 
 
-def process_pending_job(job: dict):
-    job_id = job["id"]
-    file_path = job["file_path"]
-    print(f"[Worker] Processing job {job_id}: {file_path}", flush=True)
-    update_job_status(job_id, "processing", 5)
-    try:
-        update_job_status(job_id, "processing", 10)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            filename = file_path.split("/")[-1] if "/" in file_path else file_path
-            local_video_path = os.path.join(tmpdir, filename)
-            print(f"[Worker] Downloading video: {file_path}", flush=True)
-            response = supabase.storage.from_("analysis-videos").download(file_path)
-            with open(local_video_path, "wb") as f:
-                f.write(response)
-            update_job_status(job_id, "processing", 20)
-            print(f"[Worker] Running pose analysis...", flush=True)
-            update_job_status(job_id, "processing", 40)
-            result = process_video(local_video_path)
-            update_job_status(job_id, "processing", 70)
-            result["video_path"] = file_path
-            result["job_id"] = job_id
-            update_job_status(job_id, "processing", 90)
-            print(f"[Worker] Job {job_id} completed successfully", flush=True)
-            update_job_status(job_id, "completed", 100, analysis_result=result)
-    except Exception as e:
-        error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"[Worker] Job {job_id} failed: {error_msg}", flush=True)
-        print(traceback.format_exc(), flush=True)
-        update_job_status(job_id, "failed", 0, error_message=error_msg)
-
-
-def process_next_job() -> bool:
-    if not supabase:
-        return False
+def fetch_pending_job() -> Optional[dict]:
+    """Fetch the oldest pending job from the database."""
     try:
         response = (
             supabase.table("analysis_videos")
@@ -331,137 +328,133 @@ def process_next_job() -> bool:
             .execute()
         )
         jobs = response.data
-        if not jobs:
-            return False
-        job = jobs[0]
-        process_pending_job(job)
-        return True
+        return jobs[0] if jobs else None
     except Exception as e:
-        print(f"[Worker] Error querying for jobs: {e}", flush=True)
-        return False
-
-
-def background_worker_loop():
-    """Infinite loop that polls for pending jobs."""
-    print("[Worker] Background worker started", flush=True)
-    while True:
-        try:
-            job_found = process_next_job()
-            if not job_found:
-                time.sleep(POLL_INTERVAL)
-        except Exception as e:
-            print(f"[Worker] Error in worker loop: {e}", flush=True)
-            time.sleep(POLL_INTERVAL)
-
-
-def start_background_worker():
-    """Start the background worker in a non-daemon thread."""
-    global worker_thread
-    print("[Startup] Starting background worker...", flush=True)
-    worker_thread = threading.Thread(
-        target=background_worker_loop,
-        name="PoseAnalysisWorker",
-        daemon=False
-    )
-    worker_thread.start()
-    print("[Startup] Background worker started", flush=True)
+        print(f"[DB] Error fetching pending job: {e}", flush=True)
+        return None
 
 
 # =============================================================================
-# API ENDPOINTS
+# JOB PROCESSING
 # =============================================================================
 
-@app.get("/")
-def root():
-    """Root health check for Railway."""
-    return {"status": "ok"}
-
-
-@app.get("/health")
-def health():
-    """Detailed health check."""
-    global worker_thread
-    worker_alive = worker_thread is not None and worker_thread.is_alive()
-    return {
-        "status": "healthy",
-        "worker_running": worker_alive
-    }
-
-
-class ProcessRequest(BaseModel):
-    bucket: str
-    path: str
-
-
-class ProcessResponse(BaseModel):
-    video_path: str
-    video_metadata: dict
-    pose_sequence: list
-    keyframes: list
-    analysis_summary: dict
-
-
-@app.post("/process", response_model=ProcessResponse)
-def process_endpoint(request: ProcessRequest):
-    """Manual endpoint to process a video."""
-    bucket = request.bucket
-    path = request.path
+def process_job(job: dict):
+    """
+    Process a single job from the analysis_videos table.
+    Downloads video, runs pose analysis, updates database with results.
+    """
+    job_id = job["id"]
+    file_path = job["file_path"]
+    
+    print(f"[Job] Starting job {job_id}", flush=True)
+    print(f"[Job] File path: {file_path}", flush=True)
+    
+    # Mark as processing
+    update_job_status(job_id, "processing", 5)
+    
     try:
-        parts = path.rsplit("/", 1)
-        user_id = parts[0] if len(parts) > 1 else ""
-        filename = parts[-1]
-        uuid = filename.rsplit(".", 1)[0]
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid path format")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        local_video_path = os.path.join(tmpdir, filename)
-        try:
-            response = supabase.storage.from_(bucket).download(path)
+        # Download video from Supabase Storage
+        print(f"[Job] Downloading video...", flush=True)
+        update_job_status(job_id, "processing", 10)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = file_path.split("/")[-1] if "/" in file_path else file_path
+            local_video_path = os.path.join(tmpdir, filename)
+            
+            response = supabase.storage.from_("analysis-videos").download(file_path)
             with open(local_video_path, "wb") as f:
                 f.write(response)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}")
-        try:
+            
+            print(f"[Job] Video downloaded to {local_video_path}", flush=True)
+            update_job_status(job_id, "processing", 20)
+            
+            # Run MediaPipe pose analysis
+            print(f"[Job] Running pose analysis...", flush=True)
+            update_job_status(job_id, "processing", 30)
+            
             result = process_video(local_video_path)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to process video: {str(e)}")
-        result["video_path"] = path
-        result["video_id"] = uuid
-        result["video_key"] = f"{bucket}/{path}"
-        output_json = json.dumps(result, indent=2)
-        output_path = f"{user_id}/{uuid}.json"
-        try:
-            supabase.storage.from_("analysis-results").upload(
-                output_path,
-                output_json.encode("utf-8"),
-                file_options={"content-type": "application/json", "upsert": "true"}
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to upload result: {str(e)}")
-    return ProcessResponse(
-        video_path=path,
-        video_metadata=result["video_metadata"],
-        pose_sequence=result["pose_sequence"],
-        keyframes=result["keyframes"],
-        analysis_summary=result["analysis_summary"]
-    )
+            
+            update_job_status(job_id, "processing", 80)
+            
+            # Add metadata to result
+            result["video_path"] = file_path
+            result["job_id"] = job_id
+            
+            # Mark as completed with results
+            print(f"[Job] Analysis complete. Frames processed: {result['video_metadata']['processed_frames']}", flush=True)
+            update_job_status(job_id, "completed", 100, analysis_result=result)
+            print(f"[Job] Job {job_id} completed successfully", flush=True)
+    
+    except Exception as e:
+        # Mark as failed with error message
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"[Job] Job {job_id} failed: {error_msg}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        update_job_status(job_id, "failed", 0, error_message=error_msg)
 
 
 # =============================================================================
-# MAIN ENTRY POINT
+# MAIN WORKER LOOP
+# =============================================================================
+
+def run_worker():
+    """
+    Main worker loop. Runs forever, polling for pending jobs.
+    
+    This is a BLOCKING infinite loop that:
+    1. Checks for pending jobs in the database
+    2. If found, processes ONE job
+    3. If not found, sleeps for POLL_INTERVAL seconds
+    4. Repeats forever
+    
+    The process never exits. Railway will keep it running as a background worker.
+    """
+    print("=" * 60, flush=True)
+    print("MEDIAPIPE POSE ANALYSIS WORKER", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Poll interval: {POLL_INTERVAL} seconds", flush=True)
+    print(f"Supabase URL: {SUPABASE_URL[:50]}...", flush=True)
+    print("Worker starting...", flush=True)
+    print("=" * 60, flush=True)
+    
+    while True:
+        try:
+            # Fetch the next pending job
+            job = fetch_pending_job()
+            
+            if job:
+                # Process the job
+                process_job(job)
+            else:
+                # No pending jobs, wait before polling again
+                print(f"[Worker] No pending jobs. Sleeping {POLL_INTERVAL}s...", flush=True)
+                time.sleep(POLL_INTERVAL)
+        
+        except KeyboardInterrupt:
+            print("[Worker] Received interrupt signal. Exiting...", flush=True)
+            break
+        
+        except Exception as e:
+            # Log unexpected errors but keep running
+            print(f"[Worker] Unexpected error: {e}", flush=True)
+            print(traceback.format_exc(), flush=True)
+            print(f"[Worker] Sleeping {POLL_INTERVAL}s before retry...", flush=True)
+            time.sleep(POLL_INTERVAL)
+    
+    print("[Worker] Worker stopped.", flush=True)
+
+
+# =============================================================================
+# ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
-    import uvicorn
+    """
+    Entry point for the worker.
     
-    # Get port from environment
-    port = int(os.environ.get("PORT", 8080))
-    print(f"[Main] PORT = {port}", flush=True)
+    This script runs a single blocking infinite loop.
+    No HTTP server, no ports, no health checks.
     
-    # Start background worker BEFORE uvicorn
-    # This ensures the worker thread is running
-    start_background_worker()
-    
-    # Run uvicorn - this blocks forever
-    print(f"[Main] Starting uvicorn on 0.0.0.0:{port}", flush=True)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    Railway should run this as a "Worker" service, not a "Web" service.
+    """
+    run_worker()
