@@ -33,4 +33,5 @@ COPY server.py .
 # Use SHELL FORM (not exec form) so $PORT expands at runtime
 # Railway injects PORT env var - we default to 8080 if not set
 # Running uvicorn directly ensures proper signal handling
-CMD uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT}"]
+
