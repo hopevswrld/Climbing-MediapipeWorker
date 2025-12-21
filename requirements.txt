@@ -3,8 +3,9 @@ fastapi==0.109.2
 uvicorn[standard]==0.27.1
 pydantic==2.6.1
 
-# Supabase client
-supabase==2.3.4
+# Supabase client (use older stable version to avoid httpx proxy conflict)
+supabase==2.0.3
+httpx==0.25.2
 
 # MediaPipe for pose estimation (CPU-only, no GPU required)
 mediapipe==0.10.9
@@ -14,4 +15,3 @@ opencv-python-headless==4.9.0.80
 
 # NumPy for numerical operations
 numpy==1.26.4
-
