@@ -1,0 +1,24 @@
+# Secrets & Keys
+*.pem
+*.key
+.env
+.env.*
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Test outputs
+test_output.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
