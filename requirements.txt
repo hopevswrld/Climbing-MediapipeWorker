@@ -9,3 +9,6 @@ opencv-python-headless==4.9.0.80
 
 # NumPy for numerical operations
 numpy==1.26.4
+
+# FFmpeg wrapper for HDR to SDR transcoding
+ffmpeg-python==0.2.0
