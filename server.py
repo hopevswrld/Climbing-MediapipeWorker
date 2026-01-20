@@ -60,32 +60,31 @@ def get_aws_secret(secret_name: str, region: str = "us-east-1") -> dict:
 # CONFIGURATION
 # =============================================================================
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 WORKER_ID = os.environ.get("WORKER_ID", f"worker-{os.getpid()}")
+
+# Fetch Supabase credentials from AWS Secrets Manager
+try:
+    supabase_secret = get_aws_secret("Supabase", region="us-east-1")
+    SUPABASE_URL = supabase_secret.get("SUPABASE_URL") or supabase_secret.get("url") or ""
+    SUPABASE_SERVICE_ROLE_KEY = supabase_secret.get("SUPABASE_SERVICE_ROLE_KEY") or supabase_secret.get("service_role_key") or ""
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        print("[Config] Supabase credentials loaded from AWS Secrets Manager", flush=True)
+    else:
+        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in secret")
+except Exception as e:
+    print(f"[Config] AWS Secrets Manager failed: {e}, falling back to env vars", flush=True)
+    SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+    SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 # Fetch WORKER_API_KEY from AWS Secrets Manager
 WORKER_API_KEY = ""
 try:
     worker_secret = get_aws_secret("WorkerKey", region="us-east-1")
-    # Handle multiple possible formats:
-    # 1. {"WORKER_API_KEY": "..."} - explicit key
-    # 2. {"WorkerKey": "..."} - secret name as key
-    # 3. {"value": "..."} - plain string wrapped by our parser
-    # 4. Any other single-key JSON - use the first value
-    WORKER_API_KEY = (
-        worker_secret.get("WORKER_API_KEY") or
-        worker_secret.get("WorkerKey") or
-        worker_secret.get("value") or
-        (list(worker_secret.values())[0] if len(worker_secret) == 1 else "")
-    )
+    WORKER_API_KEY = worker_secret.get("WORKER_API_KEY") or worker_secret.get("WorkerKey") or worker_secret.get("value") or (list(worker_secret.values())[0] if len(worker_secret) == 1 else "")
     if WORKER_API_KEY:
         print("[Config] WORKER_API_KEY loaded from AWS Secrets Manager", flush=True)
-    else:
-        print("[Config] Warning: WorkerKey secret found but could not extract key", flush=True)
 except Exception as e:
-    print(f"[Config] Could not load WORKER_API_KEY from AWS: {e}", flush=True)
-    print("[Config] Running in legacy mode (no credit tracking)", flush=True)
+    print(f"[Config] Could not load WORKER_API_KEY: {e}", flush=True)
 
 TARGET_FPS = 15
 KEYFRAME_ANGLE_DELTA = 20
