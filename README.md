@@ -40,6 +40,25 @@ This worker continuously polls a Supabase database for pending video analysis jo
 ```bash
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+WORKER_ID=worker-1                          # Optional: instance identifier
+```
+
+## AWS Secrets Manager
+
+The worker fetches `WORKER_API_KEY` from AWS Secrets Manager:
+- **Secret Name:** `WorkerKey`
+- **Region:** `us-east-1`
+- **Format:** JSON with `WORKER_API_KEY` field, or plain string
+
+This key must match the `WORKER_API_KEY` secret set in Supabase Edge Functions. If the secret cannot be fetched, the worker runs in legacy mode without credit tracking.
+
+**IAM Permissions Required:**
+```json
+{
+  "Effect": "Allow",
+  "Action": "secretsmanager:GetSecretValue",
+  "Resource": "arn:aws:secretsmanager:us-east-1:*:secret:WorkerKey*"
+}
 ```
 
 ## Local Development

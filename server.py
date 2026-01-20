@@ -5,6 +5,7 @@ PURE BACKGROUND WORKER - NO HTTP, NO PORTS, NO SERVERS
 Just an infinite loop that polls the database and processes videos.
 """
 
+import json
 import os
 import math
 import signal
@@ -15,11 +16,44 @@ import traceback
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
+import boto3
+from botocore.exceptions import ClientError
 import cv2
 import ffmpeg
 import mediapipe as mp
 import numpy as np
+import requests
 from supabase import create_client, Client
+
+
+# =============================================================================
+# AWS SECRETS MANAGER
+# =============================================================================
+
+def get_aws_secret(secret_name: str, region: str = "us-east-1") -> dict:
+    """
+    Fetch a secret from AWS Secrets Manager.
+    Returns the secret as a dict (parsed from JSON) or raises an exception.
+    """
+    client = boto3.client("secretsmanager", region_name=region)
+
+    try:
+        response = client.get_secret_value(SecretId=secret_name)
+        secret_string = response.get("SecretString")
+
+        if secret_string:
+            # Try to parse as JSON, otherwise return as single value
+            try:
+                return json.loads(secret_string)
+            except json.JSONDecodeError:
+                return {"value": secret_string}
+        else:
+            raise ValueError(f"Secret {secret_name} has no string value")
+
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "Unknown")
+        print(f"[AWS] Failed to fetch secret {secret_name}: {error_code}", flush=True)
+        raise
 
 
 # =============================================================================
@@ -28,6 +62,30 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+WORKER_ID = os.environ.get("WORKER_ID", f"worker-{os.getpid()}")
+
+# Fetch WORKER_API_KEY from AWS Secrets Manager
+WORKER_API_KEY = ""
+try:
+    worker_secret = get_aws_secret("WorkerKey", region="us-east-1")
+    # Handle multiple possible formats:
+    # 1. {"WORKER_API_KEY": "..."} - explicit key
+    # 2. {"WorkerKey": "..."} - secret name as key
+    # 3. {"value": "..."} - plain string wrapped by our parser
+    # 4. Any other single-key JSON - use the first value
+    WORKER_API_KEY = (
+        worker_secret.get("WORKER_API_KEY") or
+        worker_secret.get("WorkerKey") or
+        worker_secret.get("value") or
+        (list(worker_secret.values())[0] if len(worker_secret) == 1 else "")
+    )
+    if WORKER_API_KEY:
+        print("[Config] WORKER_API_KEY loaded from AWS Secrets Manager", flush=True)
+    else:
+        print("[Config] Warning: WorkerKey secret found but could not extract key", flush=True)
+except Exception as e:
+    print(f"[Config] Could not load WORKER_API_KEY from AWS: {e}", flush=True)
+    print("[Config] Running in legacy mode (no credit tracking)", flush=True)
 
 TARGET_FPS = 15
 KEYFRAME_ANGLE_DELTA = 20
@@ -434,7 +492,7 @@ def update_job_status(job_id: str, status: str, progress: int,
         update_data["analysis_result"] = analysis_result
     if error_message is not None:
         update_data["error_message"] = error_message
-    
+
     try:
         supabase.table("analysis_videos").update(update_data).eq("id", job_id).execute()
         print(f"[DB] Job {job_id}: status={status}, progress={progress}", flush=True)
@@ -459,6 +517,89 @@ def fetch_pending_job() -> Optional[dict]:
 
 
 # =============================================================================
+# EDGE FUNCTION API CALLS (Credit System Authorization)
+# =============================================================================
+
+def claim_job_authorization(job_id: str) -> dict:
+    """
+    Claim a job via the Edge Function for credit system authorization.
+    Returns authorization info or raises exception on failure.
+    """
+    if not WORKER_API_KEY:
+        # Legacy mode: no API key configured, skip authorization
+        print(f"[Auth] No WORKER_API_KEY configured, running in legacy mode", flush=True)
+        return {"authorized": True, "legacy": True, "tokenId": None}
+
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL}/functions/v1/worker-claim-job",
+            headers={
+                "X-Worker-Secret": WORKER_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "analysisVideoId": job_id,
+                "workerId": WORKER_ID
+            },
+            timeout=30
+        )
+
+        result = response.json()
+
+        if response.status_code == 200 and result.get("authorized"):
+            print(f"[Auth] Job {job_id} authorized (token: {result.get('tokenId', 'legacy')})", flush=True)
+            return result
+        else:
+            error = result.get("error", "Unknown authorization error")
+            print(f"[Auth] Job {job_id} not authorized: {error}", flush=True)
+            raise Exception(f"Authorization failed: {error}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"[Auth] Network error claiming job {job_id}: {e}", flush=True)
+        raise Exception(f"Network error: {e}")
+
+
+def complete_job_authorization(job_id: str, token_id: Optional[str], success: bool,
+                                analysis_result: dict = None, error_message: str = None):
+    """
+    Report job completion to the Edge Function for credit tracking/refunds.
+    """
+    if not WORKER_API_KEY:
+        # Legacy mode: no API key configured, skip
+        return
+
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL}/functions/v1/worker-complete-job",
+            headers={
+                "X-Worker-Secret": WORKER_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "analysisVideoId": job_id,
+                "tokenId": token_id,
+                "success": success,
+                "analysisResult": analysis_result,
+                "errorMessage": error_message
+            },
+            timeout=30
+        )
+
+        result = response.json()
+        status = "completed" if success else "failed"
+        refunded = result.get("refunded", False)
+
+        if refunded:
+            print(f"[Auth] Job {job_id} {status}, credit refunded", flush=True)
+        else:
+            print(f"[Auth] Job {job_id} {status}", flush=True)
+
+    except requests.exceptions.RequestException as e:
+        print(f"[Auth] Warning: Failed to report completion for {job_id}: {e}", flush=True)
+        # Non-fatal: job still processed, just tracking failed
+
+
+# =============================================================================
 # JOB PROCESSING
 # =============================================================================
 
@@ -472,9 +613,23 @@ def process_next_job():
     job_id = job["id"]
     file_path = job["file_path"]
     user_id = job.get("user_id")
+    token_id = None
 
     print(f"[Job] Starting: {job_id}", flush=True)
-    update_job_status(job_id, "processing", 5)
+
+    # Step 1: Claim job authorization (credit system)
+    try:
+        auth_result = claim_job_authorization(job_id)
+        token_id = auth_result.get("tokenId")
+        is_legacy = auth_result.get("legacy", False)
+
+        if is_legacy:
+            # Legacy mode: update status directly
+            update_job_status(job_id, "processing", 5)
+    except Exception as e:
+        print(f"[Job] Authorization failed for {job_id}: {e}", flush=True)
+        # Don't process unauthorized jobs
+        return True  # Return True to avoid infinite loop on same job
 
     try:
         print(f"[Job] Downloading video...", flush=True)
@@ -549,11 +704,17 @@ def process_next_job():
             update_job_status(job_id, "completed", 100, analysis_result=result)
             print(f"[Job] Completed: {job_id}", flush=True)
 
+            # Report success to credit system
+            complete_job_authorization(job_id, token_id, success=True, analysis_result=result)
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         print(f"[Job] Failed: {error_msg}", flush=True)
         traceback.print_exc()
         update_job_status(job_id, "failed", 0, error_message=error_msg)
+
+        # Report failure to credit system (triggers refund)
+        complete_job_authorization(job_id, token_id, success=False, error_message=error_msg)
 
     return True
 
